@@ -1,0 +1,95 @@
+name: Release
+
+# Dispara ao enviar uma tag no formato v0.1.1 (precisa bater com a versão do Cargo.toml).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: conferir versão
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag precisa bater com Cargo.toml
+        run: |
+          cargo_v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v${cargo_v}" != "${GITHUB_REF_NAME}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} != versão do Cargo.toml (v${cargo_v})"; exit 1
+          fi
+
+  build:
+    name: build (${{ matrix.name }})
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64,   os: ubuntu-22.04,   target: x86_64-unknown-linux-gnu }
+          - { name: macos-arm64,    os: macos-latest,   target: aarch64-apple-darwin }
+          - { name: macos-x86_64,   os: macos-latest,   target: x86_64-apple-darwin }
+          - { name: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Configurar git (os testes criam repositórios)
+        run: |
+          git config --global user.name "ci"
+          git config --global user.email "ci@local"
+      - name: Testes
+        # Em macOS x86_64 o binário é cross-compilado e não roda no runner arm64.
+        if: matrix.name != 'macos-x86_64'
+        run: cargo test --locked
+      - name: Build release
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Empacotar
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          DIR="gitmeta-${VERSION}-${{ matrix.name }}"
+          EXT=""; [ "${{ matrix.os }}" = "windows-latest" ] && EXT=".exe"
+          mkdir -p "$DIR" dist
+          cp "target/${{ matrix.target }}/release/gitmeta${EXT}" "$DIR/"
+          cp README.md "$DIR/"
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            7z a "dist/${DIR}.zip" "$DIR"
+          else
+            tar czf "dist/${DIR}.tar.gz" "$DIR"
+          fi
+          if [ "${{ matrix.name }}" = "linux-x86_64" ]; then
+            ./scripts/appimage.sh "$VERSION" "target/${{ matrix.target }}/release/gitmeta"
+            mv "gitmeta-${VERSION}-x86_64.AppImage" dist/
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publicar release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

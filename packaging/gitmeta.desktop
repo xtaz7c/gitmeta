@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=gitmeta
+Comment=Issues e PRs locais para Git (CLI)
+Exec=gitmeta
+Icon=gitmeta
+Terminal=true
+Categories=Development;
