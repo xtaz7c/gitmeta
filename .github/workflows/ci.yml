@@ -20,6 +20,7 @@ jobs:
         run: |
           git config --global user.name "ci"
           git config --global user.email "ci@local"
+          git config --global --add safe.directory '*'
       - name: Testes
         run: cargo test --locked
       - name: Build release

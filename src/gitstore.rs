@@ -9,6 +9,16 @@ use std::path::Path;
 pub const REF: &str = "refs/meta/issues";
 const TENTATIVAS: u32 = 64;
 
+/// Erros transitórios de disputa pela ref. No Windows o libgit2 reporta "acesso negado" /
+/// violação de compartilhamento (classe Os) em vez de "locked" quando duas escritas colidem.
+fn retryable(e: &git2::Error) -> bool {
+    matches!(e.code(), ErrorCode::Exists | ErrorCode::Modified | ErrorCode::Locked)
+        || matches!(
+            e.class(),
+            git2::ErrorClass::Os | git2::ErrorClass::Reference | git2::ErrorClass::Odb | git2::ErrorClass::Filesystem
+        )
+}
+
 /// Espera curta com jitter entre tentativas de trocar a ref (evita briga em lockstep).
 fn backoff(tentativa: u32) {
     let base = 50u64 << tentativa.min(7); // 50µs .. ~6,4ms
@@ -21,6 +31,14 @@ fn backoff(tentativa: u32) {
 
 pub struct GitStore {
     repo: Repository,
+    /// Último erro transitório visto (aparece na mensagem se as tentativas acabarem).
+    ultimo: std::cell::RefCell<String>,
+}
+
+enum Passo {
+    Feito,
+    Existe,
+    Repetir,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -33,23 +51,31 @@ pub enum MergeOutcome {
 
 impl GitStore {
     pub fn open(path: impl AsRef<Path>) -> Result<GitStore, StoreError> {
-        Ok(GitStore { repo: Repository::open(path)? })
+        Ok(GitStore { repo: Repository::open(path)?, ultimo: Default::default() })
     }
 
     pub fn discover(path: impl AsRef<Path>) -> Result<GitStore, StoreError> {
-        Ok(GitStore { repo: Repository::discover(path)? })
+        Ok(GitStore { repo: Repository::discover(path)?, ultimo: Default::default() })
     }
 
     pub fn repo(&self) -> &Repository {
         &self.repo
     }
 
-    fn tip_of(&self, name: &str) -> Result<Option<Commit<'_>>, StoreError> {
+    fn tip_raw(&self, name: &str) -> Result<Option<Commit<'_>>, git2::Error> {
         match self.repo.find_reference(name) {
             Ok(r) => Ok(Some(r.peel_to_commit()?)),
             Err(e) if e.code() == ErrorCode::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
+            Err(e) => Err(e),
         }
+    }
+
+    fn tip_of(&self, name: &str) -> Result<Option<Commit<'_>>, StoreError> {
+        Ok(self.tip_raw(name)?)
+    }
+
+    fn note(&self, e: &git2::Error) {
+        *self.ultimo.borrow_mut() = e.message().to_owned();
     }
 
     fn signature(ev: &Event) -> Signature<'static> {
@@ -66,7 +92,10 @@ impl GitStore {
         };
         match res {
             Ok(_) => Ok(true),
-            Err(e) if matches!(e.code(), ErrorCode::Exists | ErrorCode::Modified | ErrorCode::Locked) => Ok(false),
+            Err(e) if retryable(&e) => {
+                self.note(&e);
+                Ok(false)
+            }
             Err(e) => Err(e.into()),
         }
     }
@@ -141,6 +170,43 @@ impl GitStore {
     }
 }
 
+impl GitStore {
+    /// Uma tentativa de gravar: lê a ponta, monta a árvore, comita e troca a ref de forma atômica.
+    fn tentar(&self, ev: &Event, fname: &str, blob: Oid, sig: &Signature) -> Result<Passo, git2::Error> {
+        let tip = self.tip_raw(REF)?;
+        let base = tip.as_ref().map(Commit::tree).transpose()?;
+
+        let sub_old = match base.as_ref().and_then(|t| t.get_name(&ev.target)) {
+            Some(e) => Some(self.repo.find_tree(e.id())?),
+            None => None,
+        };
+        let mut sub = self.repo.treebuilder(sub_old.as_ref())?;
+        if sub.get(fname)?.is_some() {
+            return Ok(Passo::Existe);
+        }
+        sub.insert(fname, blob, FileMode::Blob.into())?;
+        let sub_id = sub.write()?;
+
+        let mut root = self.repo.treebuilder(base.as_ref())?;
+        root.insert(&ev.target, sub_id, FileMode::Tree.into())?;
+        let tree = self.repo.find_tree(root.write()?)?;
+
+        let msg = format!("{} {}", ev.kind, ev.target);
+        let parents: Vec<&Commit> = tip.iter().collect();
+        let oid = self.repo.commit(None, sig, sig, &msg, &tree, &parents)?;
+        let res = match tip.as_ref().map(Commit::id) {
+            None => self.repo.reference(REF, oid, false, &msg),
+            Some(old) => self.repo.reference_matching(REF, oid, true, old, &msg),
+        };
+        match res {
+            Ok(_) => Ok(Passo::Feito),
+            // Outra escrita venceu: o chamador relê a ponta e repete.
+            Err(e) if matches!(e.code(), ErrorCode::Exists | ErrorCode::Modified | ErrorCode::Locked) => Ok(Passo::Repetir),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 impl EventStore for GitStore {
     fn append(&self, ev: &Event) -> Result<(), StoreError> {
         ev.validate().map_err(StoreError::Invalid)?;
@@ -149,40 +215,25 @@ impl EventStore for GitStore {
             return Err(StoreError::Invalid("evento passa do limite de tamanho".into()));
         }
         let fname = format!("{}.json", ev.id);
-        let blob = self.repo.blob(&bytes)?;
         let sig = Self::signature(ev);
+        let blob = self.repo.blob(&bytes)?;
 
         for tentativa in 0..TENTATIVAS {
             if tentativa > 0 {
                 backoff(tentativa);
             }
-            let tip = self.tip_of(REF)?;
-            let base = tip.as_ref().map(Commit::tree).transpose()?;
-
-            let sub_old = match base.as_ref().and_then(|t| t.get_name(&ev.target)) {
-                Some(e) => Some(self.repo.find_tree(e.id())?),
-                None => None,
-            };
-            let mut sub = self.repo.treebuilder(sub_old.as_ref())?;
-            if sub.get(&fname)?.is_some() {
-                return Err(StoreError::Exists);
+            match self.tentar(ev, &fname, blob, &sig) {
+                Ok(Passo::Feito) => return Ok(()),
+                Ok(Passo::Existe) => return Err(StoreError::Exists),
+                Ok(Passo::Repetir) => {}
+                Err(e) if retryable(&e) => self.note(&e),
+                Err(e) => return Err(e.into()),
             }
-            sub.insert(&fname, blob, FileMode::Blob.into())?;
-            let sub_id = sub.write()?;
-
-            let mut root = self.repo.treebuilder(base.as_ref())?;
-            root.insert(&ev.target, sub_id, FileMode::Tree.into())?;
-            let tree = self.repo.find_tree(root.write()?)?;
-
-            let msg = format!("{} {}", ev.kind, ev.target);
-            let parents: Vec<&Commit> = tip.iter().collect();
-            let oid = self.repo.commit(None, &sig, &sig, &msg, &tree, &parents)?;
-            if self.swap_ref(tip.as_ref().map(Commit::id), oid, &msg)? {
-                return Ok(());
-            }
-            // Outra escrita concorrente venceu: relê a ponta e tenta de novo.
         }
-        Err(StoreError::Git("muita concorrência na ref; tente de novo".into()))
+        Err(StoreError::Git(format!(
+            "muita concorrência na ref ({TENTATIVAS} tentativas); último erro: {}",
+            self.ultimo.borrow()
+        )))
     }
 
     fn load(&self, target: &str) -> Result<Loaded, StoreError> {

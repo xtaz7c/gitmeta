@@ -45,30 +45,55 @@ jobs:
         run: |
           git config --global user.name "ci"
           git config --global user.email "ci@local"
+          git config --global --add safe.directory '*'
       - name: Testes
         # Em macOS x86_64 o binário é cross-compilado e não roda no runner arm64.
         if: matrix.name != 'macos-x86_64'
         run: cargo test --locked
       - name: Build release
         run: cargo build --release --locked --target ${{ matrix.target }}
-      - name: Empacotar
+      - name: Empacotar (Linux e macOS)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           DIR="gitmeta-${VERSION}-${{ matrix.name }}"
-          EXT=""; [ "${{ matrix.os }}" = "windows-latest" ] && EXT=".exe"
           mkdir -p "$DIR" dist
-          cp "target/${{ matrix.target }}/release/gitmeta${EXT}" "$DIR/"
+          cp "target/${{ matrix.target }}/release/gitmeta" "$DIR/"
           cp README.md "$DIR/"
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            7z a "dist/${DIR}.zip" "$DIR"
-          else
-            tar czf "dist/${DIR}.tar.gz" "$DIR"
-          fi
+          tar czf "dist/${DIR}.tar.gz" "$DIR"
           if [ "${{ matrix.name }}" = "linux-x86_64" ]; then
             ./scripts/appimage.sh "$VERSION" "target/${{ matrix.target }}/release/gitmeta"
             mv "gitmeta-${VERSION}-x86_64.AppImage" dist/
           fi
+      - name: Empacotar (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $v = $env:GITHUB_REF_NAME.TrimStart('v')
+          $dir = "gitmeta-$v-${{ matrix.name }}"
+          $exe = Join-Path $PWD "target/${{ matrix.target }}/release/gitmeta.exe"
+
+          # Teste de fumaça do .exe: versão + criar e listar uma issue num repo Git novo.
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw "gitmeta.exe --version falhou" }
+          $smoke = Join-Path $env:RUNNER_TEMP "gitmeta-smoke"
+          git init -q $smoke
+          Push-Location $smoke
+          $env:GITMETA_NAME = 'ci'; $env:GITMETA_EMAIL = 'ci@local'
+          & $exe issue-open "fumaça" "windows"
+          if ($LASTEXITCODE -ne 0) { throw "issue-open falhou" }
+          $lista = & $exe list
+          if ($LASTEXITCODE -ne 0 -or -not ($lista -match 'fumaça')) { throw "list falhou: $lista" }
+          Pop-Location
+
+          # Zip (PowerShell 7 grava separadores '/', compatível com Linux e macOS).
+          New-Item -ItemType Directory -Force -Path $dir, dist | Out-Null
+          Copy-Item $exe $dir
+          Copy-Item README.md $dir
+          Compress-Archive -Path $dir -DestinationPath "dist/$dir.zip"
+          Get-ChildItem dist | Format-Table Name, Length
       - uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.name }}
